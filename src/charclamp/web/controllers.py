@@ -8,10 +8,16 @@ from litestar.enums import RequestEncodingType
 from litestar.params import Body
 from litestar.response import Redirect, Template
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from charclamp.domain.models import BurnShift, Clamp, User
-from charclamp.domain.rules import RuleError, assert_can_set_clamp_status, can_mark_clamp_drawn
+from charclamp.domain.rules import (
+    RuleError,
+    assert_can_delete_clamp,
+    assert_can_set_clamp_status,
+    can_mark_clamp_drawn,
+)
 from charclamp.infra.db import SessionLocal
 from charclamp.infra.security import verify_password
 
@@ -242,20 +248,32 @@ class ClampController(Controller):
         site_id = int(data.get("site_id") or "0")
         wood = (data.get("wood_species") or "").strip()
         async with SessionLocal() as db:
-            # 撞号：静默改写旧窑材种，不报错
+            if not code:
+                _set_flash(request, "窑号不能为空", "error")
+                return Redirect("/")
+            # 撞号必须拒绝：旧窑（含材种）原样保留，绝不静默覆盖。
             existing = (
                 await db.execute(
                     select(Clamp).where(Clamp.site_id == site_id, Clamp.code == code)
                 )
             ).scalar_one_or_none()
             if existing:
-                existing.wood_species = wood or existing.wood_species
-                await db.commit()
-                _set_flash(request, f"窑 {code} 已保存", "ok")
+                _set_flash(request, f"窑号 {code} 在本坞已存在，禁止重复新建", "error")
                 return Redirect(f"/?clamp_id={existing.id}")
             clamp = Clamp(site_id=site_id, code=code, wood_species=wood, status=Clamp.STATUS_STACKED)
             db.add(clamp)
-            await db.commit()
+            try:
+                await db.commit()
+            except IntegrityError:
+                # 并发兜底：两人几乎同时新建同号时，唯一约束只放一个落库。
+                await db.rollback()
+                winner = (
+                    await db.execute(
+                        select(Clamp).where(Clamp.site_id == site_id, Clamp.code == code)
+                    )
+                ).scalar_one_or_none()
+                _set_flash(request, f"窑号 {code} 刚刚已被他人新建，禁止重复新建", "error")
+                return Redirect(f"/?clamp_id={winner.id}" if winner else "/")
             await db.refresh(clamp)
             _set_flash(request, f"窑 {code} 已新建", "ok")
             return Redirect(f"/?clamp_id={clamp.id}")
@@ -271,10 +289,20 @@ class ClampController(Controller):
             clamp = result.scalar_one_or_none()
             if not clamp:
                 return Redirect("/")
-            # 有班次仍宣称成功，只清状态不删行 → 幽灵卡
-            clamp.status = Clamp.STATUS_STACKED
-            clamp.notes = (clamp.notes or "") + " [已删]"
-            await db.commit()
+            try:
+                # 有班次一律拒绝：不改状态、不加标记，避免“提示成功却留幽灵卡”。
+                assert_can_delete_clamp(clamp)
+            except RuleError as exc:
+                _set_flash(request, str(exc), "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
+            await db.delete(clamp)
+            try:
+                await db.commit()
+            except IntegrityError:
+                # 并发兜底：校验通过后、提交前又有班次落库到该窑。
+                await db.rollback()
+                _set_flash(request, f"窑 {clamp.code} 刚被登记了新班次，禁止删除", "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
             _set_flash(request, f"窑 {clamp.code} 已删除", "ok")
         return Redirect("/")
 
@@ -295,6 +323,9 @@ class ClampController(Controller):
             ).scalar_one_or_none()
             if not clamp:
                 return Redirect("/")
+            if not new_code:
+                _set_flash(request, "窑号不能为空", "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
             hit = (
                 await db.execute(
                     select(Clamp).where(
@@ -305,14 +336,19 @@ class ClampController(Controller):
                 )
             ).scalar_one_or_none()
             if hit:
-                hit.wood_species = wood or hit.wood_species
-                await db.commit()
-                _set_flash(request, f"窑号 {new_code} 已保存", "ok")
-                return Redirect(f"/?clamp_id={hit.id}")
+                # 撞号整笔拒绝：被撞窑与本窑都不做任何写入，旧材种原样保留。
+                _set_flash(request, f"窑号 {new_code} 在本坞已存在，禁止改号占用", "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
             clamp.code = new_code
             if wood:
                 clamp.wood_species = wood
-            await db.commit()
+            try:
+                await db.commit()
+            except IntegrityError:
+                # 并发兜底：另一人刚把别的窑改成同号，唯一约束拦下本次改号。
+                await db.rollback()
+                _set_flash(request, f"窑号 {new_code} 刚刚已被他人占用，改号失败", "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
             _set_flash(request, "窑号已更新", "ok")
             return Redirect(f"/?clamp_id={clamp_id}")
 

@@ -35,6 +35,15 @@ def can_mark_clamp_drawn(clamp: Clamp) -> tuple[bool, str]:
     return True, ""
 
 
+def assert_can_delete_clamp(clamp: Clamp) -> None:
+    """
+    删除炭窑的前提：该窑没有任何焖烧班次。
+    班次是焖烧记录的凭据，有班次时只能保留窑体，禁止删除。
+    """
+    if clamp.shifts:
+        raise RuleError(f"窑 {clamp.code} 尚有 {len(clamp.shifts)} 条焖烧班次，禁止删除")
+
+
 def assert_can_set_clamp_status(clamp: Clamp, new_status: str) -> None:
     allowed = {Clamp.STATUS_STACKED, Clamp.STATUS_BURNING, Clamp.STATUS_DRAWN}
     if new_status not in allowed:
